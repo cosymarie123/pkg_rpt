@@ -1,0 +1,824 @@
+--ERP_KHAL Create and update 04/12/2024 OM_055_premiere
+create or replace PACKAGE BODY                    apps.xxff_om_055_api_gd2_improve as
+    function get_rate(p_tax_code varchar2) return number
+    is
+        l_result number;
+    begin
+        select percentage_rate into l_result 
+        from zx_rates_b where tax_rate_code = p_tax_code;
+        return l_result;
+    exception
+    when others then return null;
+    end get_rate;
+    function    get_curr_conversion_rate(
+        p_transactional_curr_code   varchar2,
+        p_transaction_date          date
+    ) return number
+    is
+        l_result number;
+    begin
+        select  conversion_rate into l_result 
+        from    gl_daily_rates 
+        where   from_currency = p_transactional_curr_code
+        and     conversion_date = p_transaction_date
+        and     to_currency = 'VND';
+        return l_result;
+    exception
+    when others then return null;
+    end get_curr_conversion_rate;
+    function get_vendor_name(
+        p_vendor_id varchar2
+    ) return varchar2
+    is
+        l_result varchar2(240);
+        l_vendor_id number := to_number(p_vendor_id);
+    begin
+        select a.vendor_name into l_result
+        from    apps.po_vendors a
+        where   a.attribute2 = 'NCC270'
+        and     a.vendor_id = l_vendor_id;
+        return l_result;
+    exception
+    when others then return null;
+    end get_vendor_name;
+    --
+    function get_dongiavanchuyen(
+        p_header_id number,
+        p_line_id   number
+    ) return number
+    is
+        l_result number;
+    begin
+        select  sum(opa.adjusted_amount) into l_result
+        from    apps.oe_price_adjustments opa, apps.qp_list_headers_all_b qlh
+        where   opa.list_header_id = qlh.list_header_id
+        and     header_id = p_header_id
+        and     line_id = p_line_id
+        and     qlh.attribute2 in ('CPVC', 'CPVCDM', 'CPVC_XK');
+        return l_result;
+    exception
+    when others then return null;
+    end ;
+    procedure fetch_data(
+        p_ou_id                 IN varchar2,
+        p_date_from             IN varchar2,
+        p_date_to               IN varchar2,
+        p_inv_org_id            IN varchar2,
+        p_tu_don_hang           IN varchar2,
+        p_den_don_hang          IN varchar2,
+        p_from_item_category    IN varchar2,
+        p_to_item_category      IN varchar2,
+        p_customer_no_from      IN varchar2,
+        p_customer_no_to        IN varchar2,
+        p_sales_channel         IN varchar2,
+        x_cursor                OUT SYS_REFCURSOR
+    )
+    is
+        l_start_date    date;
+        l_end_date      date;
+        l_ou_id         number := to_number(p_ou_id);
+        l_inv_org_id    number := to_number(p_inv_org_id);
+        l_master_org    number := apps.xxff_general_api.master_org;
+        L_USER          number :=  FND_PROFILE.VALUE('USER_ID');
+    begin
+        commit;
+        --execute immediate 'alter session set "_fix_control"=''17376322:OFF''';  -- THIEN 28Jul22
+        l_start_date := trunc(apps.xxff_general_api.java_date_2sql(p_date_from));-- + xxff_defs_api.c_hour_7;--7/24;
+        l_end_date := trunc(apps.xxff_general_api.java_date_2sql(p_date_to)) + 0.99999;-- + 1 + xxff_defs_api.c_hour_7;--7/24;
+        ----xxff_logs_api.insert_trace_log('OM_055', 1, 'OK01 ' || to_char(l_end_date, 'DD-MM-YYYY HH24:MI:SS'));
+        ----xxff_logs_api.insert_trace_log('OM_055', 1, 'OK01 ' || to_char(systimestamp, 'DD-MM-YYYY HH24:MI:SS.FF3'));
+        insert into SSG_OM_RPT_055_TMP2(
+                sochungtu          ,
+                ngaychungtu        ,
+                sodh               ,
+                loaidonhang        ,
+                vung               ,
+                khuvuc             ,
+                manhomkhachhang    ,
+                tennhomkhachhang   ,
+                makhachhang        ,
+                tenkhachhang       ,
+                diachi             ,
+                noigiaohang        ,
+                donvi_nhan         ,
+                makho              ,
+                manhomhang         ,
+                mahang             ,
+                tenhang            ,
+                solo               ,
+                phanloai           ,
+                ngaysanxuat        ,
+                mln_orig_date      ,
+                dvt                ,
+                khoiluong          ,
+                soluong            ,
+                tytrongthucte      ,
+                meta               ,
+                metb               ,
+                metc               ,
+                tytrong            ,
+                giavon             ,
+                giaban             ,
+                uom_conversion     ,
+                uom_conversion1    ,
+                dongiavanchuyen    ,
+                --line_id            ,
+                --inventory_item_id  ,
+                --lot_number         ,
+                madonvivanchuyen   ,
+                tendonvivanchuyen  ,
+                soxe               ,
+                ghi_chu            ,
+                rate               ,
+                tax_rate           ,
+                order_quantity_uom ,
+                primary_uom_code   ,
+                secondary_uom_code ,
+                TAIXE   --THANG THEM 16022022   
+                ,LPN
+                ,KHOILUONGGROSS
+                ,LOAILOI
+            )
+            select  WND.name   sochungtu, 
+                    to_char(nvl(MMT.transaction_date, WND.initial_pickup_date), 'DD/MM/RRRR') ngaychungtu,
+                    OEH.order_number sodh,
+                    OET.name loaidonhang,
+                    apps.xxff_general_api.get_flex_value('CUS_LANHTHO', TRT.segment1) vung,
+                    apps.xxff_general_api.get_flex_value('CUS_MIEN_KHUVUC', TRT.segment3) khuvuc,
+                    OEH.sales_channel_code      manhomkhachhang,
+                    SLE.description             tennhomkhachhang,
+                    CUS.account_number          makhachhang,
+                    PRT.party_name              tenkhachhang,
+                    xxff_om_pub_api.get_addr_sale_order(p_site_use_id =>OEH.invoice_to_org_id) diachi,
+                    nvl(OEH.attribute4, xxff_om_pub_api.get_addr_sale_order(p_site_use_id =>OEH.ship_to_org_id)) noigiaohang,
+                    WND.attribute14             donvi_nhan,
+                    ORG.organization_code       makho,
+                    ICA.category_concat_segs   manhomhang,
+                    MSI.segment1                mahang,
+                    MSI.description             tenhang,
+                    MLN.lot_number              solo,
+                    MLN.grade_code              phanloai,
+                    to_char(MLN.origination_date, 'DD/MM/RRRR') ngaysanxuat,
+                    trunc(MLN.origination_date) mln_orig_date,
+                    MSI.primary_uom_code        dvt,
+                    abs(coalesce(MTL.primary_quantity, MMT.primary_quantity, OEL.ordered_quantity)) khoiluong,
+                    abs(coalesce(MTL.secondary_transaction_quantity, MMT.secondary_transaction_quantity)) soluong,
+                    apps.xxff_general_api.to_number1(MLN.n_attribute10) tytrongthucte,
+                    abs(apps.xxff_general_api.to_number1(MLN.n_attribute1)) meta,
+                    abs(apps.xxff_general_api.to_number1(MLN.n_attribute2)) metb,
+                    abs(apps.xxff_general_api.to_number1(MLN.n_attribute3)) metc,
+                    case
+                    when nvl(nvl(MTL.secondary_transaction_quantity,mmt.secondary_transaction_quantity), 0) <> 0 then
+                        nvl(MTL.primary_quantity, mmt.primary_quantity) /
+                                nvl(MTL.secondary_transaction_quantity,mmt.secondary_transaction_quantity)
+                    end                         tytrong,                                                                                                                                    
+                    xxff_cost_pub_api.get_avg_cost(ORG.organization_id, 
+                                                  MSI.inventory_item_id, 
+                                                  MMT.transaction_date, 
+                                                  MLN.grade_code, 
+                                                  MLN.c_attribute14, 
+                                                  MSI.segment1)  giavon,       
+                    OEL.unit_selling_price      giaban,
+                    apps.xxff_general_api.uom_conversion_rate(OEL.inventory_item_id, OEL.order_quantity_uom, MSI.primary_uom_code) uom_conversion,
+                    apps.xxff_general_api.uom_conversion_rate(OEL.inventory_item_id, MSI.primary_uom_code, 'KG')  uom_conversion1,
+                    xxff_om_055_api.get_dongiavanchuyen(OEL.header_id, OEL.line_id) dongiavanchuyen,
+                    WTR.attribute1              madonvivanchuyen,
+                    case when WTR.attribute_category = 'VAN_CHUYEN_LOV'  then
+                        xxff_om_055_api.get_vendor_name(WTR.attribute1)
+                    when WTR.attribute_category = 'VAN_CHUYEN_TEXT' then
+                        WTR.attribute1
+                    else null end        tendonvivanchuyen,
+                    WTR.vehicle_number       soxe,
+                    WND.attribute15          ghi_chu,
+                    case when OEH.transactional_curr_code <> 'VND' then 
+                         nvl(to_number(WND.attribute1), xxff_om_055_api.get_curr_conversion_rate(OEH.transactional_curr_code, trunc(mmt.transaction_date)))     
+                        else
+                            1                                                                                  
+                    end rate,
+                    case when (OEL.tax_code not like '%EX' and OEL.tax_code != 'AR_VAT8') then 
+                        xxff_om_055_api.get_rate(OEL.tax_code) 
+                    end      tax_rate ,
+                    OEL.order_quantity_uom ,
+                    MSI.primary_uom_code,
+                    MSI.secondary_uom_code ,
+                    WTR.ATTRIBUTE2 AS TAIXE -- thang them 16022022
+                    ,nvl( nvl(
+                                (
+                                select CONTAINER_NAME
+                                from wsh.WSH_DELIVERY_DETAILS
+                                where DELIVERY_DETAIL_ID = WDA.parent_delivery_detail_id), WDD.CONTAINER_NAME )
+                             ,(select wlp.license_plate_number
+--                             , mmt.lpn_id, mmt.content_lpn_id, wdd.delivery_detail_id, mmt.*
+                                from apps.MTL_MATERIAL_TRANSACTIONS MMT, apps.wms_license_plate_numbers wlp
+--                                , WSH_DELIVERY_DETAILS WDD
+                                where wlp.lpn_id = nvl(mmt.lpn_id, mmt.content_lpn_id)
+                                and wdd.move_order_line_id = mmt.source_line_id
+                                and mmt.inventory_item_id = wdd.inventory_item_id
+                                and mmt.transfer_locator_id = wdd.locator_id
+                                and nvl(mmt.transaction_id,mmt.transfer_transaction_id) = wdd.transaction_id
+                                and mmt.organization_id = wdd.organization_id
+                                and mmt.transaction_type_id = 52)) lpn
+                    --MLNAV.
+                   , MLN.N_ATTRIBUTE4 AS KHOILUONGGROSS
+                   , FFVV.DESCRIPTION LOAILOI
+
+            from        wsh.wsh_delivery_details            wdd
+            join        wsh.wsh_delivery_assignments        wda ON (wdd.delivery_detail_id = wda.delivery_detail_id)
+            join        wsh.wsh_new_deliveries              wnd ON (wda.delivery_id = wnd.delivery_id)
+            join        wsh.wsh_delivery_legs               Wdl ON (WDL.delivery_id = WND.delivery_id)
+            join        wsh.wsh_trip_stops                  WTS ON (WTS.stop_id = WDL.pick_up_stop_id)
+            join        wsh.wsh_trips                       WTR ON (WTR.trip_id = WTS.trip_id)
+            join        apps.oe_order_lines_all             OEL ON (OEL.line_id = WDD.source_line_id)
+            join        apps.oe_order_headers_all           OEH ON (OEH.header_id = OEL.header_id)
+            join        apps.oe_transaction_types_tl        OET ON (OET.transaction_type_id = OEH.order_type_id)
+            left join   apps.mtl_material_transactions      MMT ON (mmt.picking_line_id = wdd.delivery_detail_id
+                                                                and mmt.trx_source_delivery_id = WND.delivery_id
+                                                                and MMT.transaction_type_id = 33)
+            left join   apps.mtl_transaction_lot_numbers    MTL ON (MTL.transaction_id = MMT.transaction_id)
+            left join   apps.mtl_lot_numbers                MLN ON (MLN.inventory_item_id = MTL.inventory_item_id
+                                                                and MLN.organization_id = MTL.organization_id
+                                                                and MLN.lot_number = MTL.lot_number)
+            join        apps.mtl_system_items_b             MSI ON (MSI.inventory_item_id = OEL.inventory_item_id
+                                                                and MSI.organization_id = l_master_org)
+            join        apps.mtl_item_category_inv_v             ICA ON (ICA.inventory_item_id = OEL.inventory_item_id)
+            join        apps.ssg_organization_tbl                ORG ON (ORG.organization_id = WDD.organization_id and org.operating_unit = wdd.org_id)
+            join        apps.hz_cust_accounts                    CUS ON (CUS.cust_account_id = OEH.sold_to_org_id)
+            join        apps.hz_cust_site_uses_all               CSU ON (CSU.site_use_id = OEH.invoice_to_org_id)
+            left join   apps.ra_territories                      TRT ON (TRT.territory_id = CSU.territory_id)
+            join        apps.hz_parties                          PRT ON (PRT.party_id = CUS.party_id)
+            left join   apps.fnd_lookup_values                   SLE ON (SLE.lookup_code = OEH.sales_channel_code 
+                                                                and lookup_type = 'SALES_CHANNEL')                  
+            left join   APPS.FND_FLEX_VALUES_VL             FFVV  ON ( FFVV.flex_value_set_id = '1016815' --CUS_LOAILOI
+                                                                        AND MLN.C_ATTRIBUTE16 = FFVV.FLEX_VALUE_MEANING ) 
+            
+            where   
+                 nvl (wnd.shipment_direction, 'O') in ('O', 'IO')
+            and     WDD.source_code = 'OE'
+            and     WDD.released_status = 'C'
+            and     (WND.organization_id = l_inv_org_id or l_inv_org_id is null)
+--            and     (OEH.order_number >= p_tu_don_hang or p_tu_don_hang is null)
+--            and     (OEH.order_number <= p_den_don_hang or p_den_don_hang is null)
+--            and     (p_sales_channel is null or OEH.sales_channel_code = p_sales_channel)
+           -- and      HSG_RESP_SALECHANEL(OEH.sales_channel_code,'SALE_CHANEL',WDD.org_id) = 1 -- SONG31052022
+--            and     (ICA.category_concat_segs >= p_from_item_category or  p_from_item_category is null)
+--            and     (ICA.category_concat_segs <= p_to_item_category or p_to_item_category is null)
+--            and     (CUS.account_number >= p_customer_no_from or p_customer_no_from is null)
+--            and     (CUS.account_number <= p_customer_no_to or p_customer_no_to is null)
+            and org.operating_unit = l_ou_id--  1 = 1 --and wnd.delivery_id = 697872
+--            and     wnd.initial_pickup_date between l_start_date and l_end_date
+            and     wnd.initial_pickup_date between l_start_date and l_end_date
+--            AND WND.INITIAL_PICKUP_DATE >= l_start_date
+--            AND WND.INITIAL_PICKUP_DATE < TO_DATE (TO_CHAR ( l_end_date, 'DD/MM/YYYY'), 'DD/MM/YYYY')
+--                + 1
+            AND ROWNUM <= 1000000
+            ;
+        --xxff_logs_api.insert_trace_log('OM_055', 1, 'OK02 ' || to_char(systimestamp, 'DD-MM-YYYY HH24:MI:SS.FF3') || sql%rowcount);
+
+        --Giao dich RMA
+            insert into SSG_OM_RPT_055_TMP2(
+                sochungtu          ,
+                ngaychungtu        ,
+                sodh               ,
+                loaidonhang        ,
+                vung               ,
+                khuvuc             ,
+                manhomkhachhang    ,
+                tennhomkhachhang   ,
+                makhachhang        ,
+                tenkhachhang       ,
+                diachi             ,
+                noigiaohang        ,
+                makho              ,
+                manhomhang         ,
+                mahang             ,
+                tenhang            ,
+                solo               ,
+                phanloai           ,
+                ngaysanxuat        ,
+                mln_orig_date      ,
+                dvt                ,
+                khoiluong          ,
+                soluong            ,
+                tytrongthucte      ,
+                meta               ,
+                metb               ,
+                metc               ,
+                tytrong            ,
+                giavon             ,
+                giaban             ,
+                uom_conversion     ,
+                uom_conversion1    ,
+                dongiavanchuyen    ,
+                --line_id            ,
+                --inventory_item_id  ,
+                --lot_number         ,
+                madonvivanchuyen   ,
+                tendonvivanchuyen  ,
+                soxe               ,
+                ghi_chu            ,
+                rate               ,
+                tax_rate           ,
+                order_quantity_uom ,
+                primary_uom_code   ,
+                secondary_uom_code ,
+                lpn,
+                khoiluonggross,
+                LOAILOI
+
+            )
+            select  
+              rsh.receipt_num sochungtu,
+           to_char(mmt.transaction_date, 'DD/MM/RRRR') ngaychungtu,
+           oh.order_number sodh,
+           ot.name loaidonhang,
+           apps.xxff_general_api.get_flex_value('CUS_LANHTHO', ter.segment1) vung,
+           apps.xxff_general_api.get_flex_value('CUS_MIEN_KHUVUC', ter.segment3) khuvuc,
+           oh.sales_channel_code manhomkhachhang,
+           (select description
+              from apps.fnd_lookup_values 
+             where lookup_type = 'SALES_CHANNEL'
+               and lookup_code = oh.sales_channel_code
+               and rownum = 1) tennhomkhachhang,
+           hca.account_number makhachhang,
+           hp.party_name tenkhachhang,
+           xxff_om_pub_api.get_addr_sale_order(p_site_use_id =>oh.invoice_to_org_id) diachi,
+           nvl(oh.attribute4,xxff_om_pub_api.get_addr_sale_order(p_site_use_id =>oh.ship_to_org_id))   noigiaohang,
+           mp.organization_code makho,
+           mcat.category_concat_segs manhomhang,
+           msi.segment1 mahang,
+           msi.description tenhang,
+           mtln.lot_number solo,
+           mln.grade_code phanloai,
+           to_char(mln.origination_date, 'DD/MM/RRRR') ngaysanxuat,
+           trunc(mln.origination_date) mln_orig_date,
+           msi.primary_uom_code dvt,
+          -abs(nvl(mtln.primary_quantity, mmt.primary_quantity)) khoiluong,
+          -abs(nvl(mtln.secondary_transaction_quantity,mmt.secondary_transaction_quantity))  soluong,
+           apps.xxff_general_api.to_number1(mln.n_attribute10) tytrongthucte,
+          -abs(apps.xxff_general_api.to_number1(mln.n_attribute1)) meta,
+          -abs(apps.xxff_general_api.to_number1(mln.n_attribute2)) metb,
+          -abs(apps.xxff_general_api.to_number1(mln.n_attribute3)) metc,
+           case
+             when nvl(nvl(mtln.secondary_transaction_quantity, mmt.secondary_transaction_quantity),0) <> 0 
+                then
+              nvl(mtln.primary_quantity, mmt.primary_quantity) /
+                    nvl(mtln.secondary_transaction_quantity,mmt.secondary_transaction_quantity)
+           end tytrong,       
+            xxff_cost_pub_api.get_avg_cost(mp.organization_id, 
+                                                          msi.inventory_item_id, 
+                                                          mmt.transaction_date, 
+                                                          mln.grade_code, 
+                                                          mln.c_attribute14, 
+                                                          msi.segment1)                                                                                                
+            giavon,                                                                             
+           ol.unit_selling_price giaban,
+           apps.xxff_general_api.uom_conversion_rate(p_inventory_item_id =>ol.inventory_item_id,
+                                                                    p_from_uom_code   =>ol.order_quantity_uom,
+                                                                    p_to_uom_code       =>msi.primary_uom_code)    
+           uom_conversion,
+           apps.xxff_general_api.uom_conversion_rate(p_inventory_item_id =>ol.inventory_item_id,
+                                                                    p_from_uom_code   =>msi.primary_uom_code,
+                                                                    p_to_uom_code       =>'KG')  
+           uom_conversion1,
+           apps.xxff_general_api.to_number1(rsh.attribute5) dongiavanchuyen,
+--           ol.line_id,
+--           ol.inventory_item_id,
+--           mtln.lot_number,
+           rsh.attribute3 madonvivanchuyen,
+          (select max(a.vendor_name)
+              from apps.po_vendors a
+             where a.attribute2 = 'NCC270'
+               and to_char(a.vendor_id) = rsh.attribute3) tendonvivanchuyen,
+           rsh.attribute4 soxe,
+           rsh.comments,
+       case when oh.transactional_curr_code <> 'VND' then 
+                 xxff_om_055_api.get_curr_conversion_rate(oh.transactional_curr_code, trunc(mmt.transaction_date))
+                else
+                    1                                                                                  
+           end rate,
+       case
+         when (ol.tax_code not like '%EX' and OL.tax_code != 'AR_VAT8') then 
+            xxff_om_055_api.get_rate(ol.tax_code) --(select percentage_rate from zx_rates_b where tax_rate_code=ol.tax_code) 
+       end tax_rate,
+       ol.order_quantity_uom ,
+       msi.primary_uom_code,
+       msi.secondary_uom_code    ,
+       (select wlp.license_plate_number
+       from apps.wms_license_plate_numbers wlp
+       where wlp.lpn_id = nvl(nvl(mmt.lpn_id, mmt.transfer_lpn_id),mmt.content_lpn_id))as LPN,
+       mln.N_ATTRIBUTE4 AS KHOILUONGGROSS,
+               ( select  FFVV.DESCRIPTION 
+            from  APPS.FND_FLEX_VALUES_VL FFVV where 
+              FFVV.flex_value_set_id = '1016815' --CUS_LOAILOI
+                AND MLN.C_ATTRIBUTE16 = FFVV.FLEX_VALUE_MEANING) LOAILOI --VUNT them 25102023
+      from apps.mtl_material_transactions   mmt,
+           apps.mtl_transaction_lot_numbers mtln,
+           apps.mtl_lot_numbers             mln,
+           apps.mtl_system_items_b          msi,
+           apps.rcv_transactions            rt,
+           apps.rcv_shipment_headers        rsh,
+           apps.oe_order_lines_all          ol,
+           apps.oe_order_headers_all        oh,
+           apps.oe_transaction_types_tl     ot,
+           apps.hz_cust_accounts            hca,
+           apps.hz_cust_site_uses_all       hcsu,
+           apps.ra_territories              ter,
+           apps.hz_parties                  hp,
+           apps.mtl_parameters              mp,
+           apps.ssg_organization_tbl                ORG,
+           mtl_item_category_inv_v MCAT
+     where 1 = 1
+       and mmt.transaction_id = mtln.transaction_id(+)
+       and mtln.lot_number = mln.lot_number(+)
+       and mtln.inventory_item_id = mln.inventory_item_id(+)
+       and mtln.organization_id = mln.organization_id(+)
+       and mmt.inventory_item_id = msi.inventory_item_id
+       and msi.organization_id = l_master_org
+       and mmt.source_line_id =rt.transaction_id
+       and rt.shipment_header_id = rsh.shipment_header_id
+       and rt.oe_order_line_id = ol.line_id 
+       and ol.header_id = oh.header_id  
+       and oh.order_type_id = ot.transaction_type_id
+       and oh.sold_to_org_id = hca.cust_account_id
+       and oh.invoice_to_org_id = hcsu.site_use_id(+)
+       and hcsu.territory_id = ter.territory_id(+)
+       and hca.party_id = hp.party_id
+       and mmt.organization_id = mp.organization_id
+--       and mmt.organization_id = mcat.organization_id
+       and mmt.inventory_item_id = mcat.inventory_item_id
+--       and mic.category_set_id = 1    -- Inventory'
+--       and mic.category_id = mcat.category_id  
+       and mmt.transaction_action_id not in (36, 24) 
+       and mmt.transaction_type_id = 15 -- RMA  
+       AND msi.organization_id = org.organization_id(+)
+       and org.operating_unit(+) = oh.org_id
+       -----------------------------------
+       /*and mmt.trx_source_line_id = wdd.source_line_id(+)
+       and mmt.inventory_item_id = wdd.inventory_item_id(+)  
+  --     and mtln.lot_number = wdd.lot_number(+) */
+       ---------------------------------
+
+       and (mmt.organization_id = l_inv_org_id or l_inv_org_id is null)
+--       and (oh.order_number >= p_tu_don_hang or p_tu_don_hang is null)
+--       and (oh.order_number <= p_den_don_hang or p_den_don_hang is null)
+--       and     (p_sales_channel is null or OH.sales_channel_code = p_sales_channel)
+--      -- and      HSG_RESP_SALECHANEL(OH.sales_channel_code, 'SALE_CHANEL',oh.org_id ) = 1 -- SONG31052022
+--       and mmt.transaction_date between  l_start_date and l_end_date
+
+--       and (mcat.category_concat_segs >= p_from_item_category or  p_from_item_category is null)
+--       and (mcat.category_concat_segs <= p_to_item_category or p_to_item_category is null)
+--       and (hca.account_number >= p_customer_no_from or p_customer_no_from is null)
+--       and (hca.account_number <= p_customer_no_to or  p_customer_no_to is null)
+       and (oh.org_id = l_ou_id)
+       and mmt.transaction_date between  l_start_date and l_end_date
+       -- AND ROWNUM <= 1000000  -- THIEN BO 26jUL2022
+       ;
+       --Giao dich RMA cho Item khong nhap kho
+       insert into SSG_OM_RPT_055_TMP2(
+                sochungtu          ,
+                ngaychungtu        ,
+                sodh               ,
+                loaidonhang        ,
+                vung               ,
+                khuvuc             ,
+                manhomkhachhang    ,
+                tennhomkhachhang   ,
+                makhachhang        ,
+                tenkhachhang       ,
+                diachi             ,
+                noigiaohang        ,
+                makho              ,
+                manhomhang         ,
+                mahang             ,
+                tenhang            ,
+                solo               ,
+                phanloai           ,
+                ngaysanxuat        ,
+                mln_orig_date      ,
+                dvt                ,
+                khoiluong          ,
+                soluong            ,
+                tytrongthucte      ,
+                meta               ,
+                metb               ,
+                metc               ,
+                tytrong            ,
+                giavon             ,
+                giaban             ,
+                uom_conversion     ,
+                uom_conversion1    ,
+                dongiavanchuyen    ,
+                --line_id            ,
+                --inventory_item_id  ,
+                --lot_number         ,
+                madonvivanchuyen   ,
+                tendonvivanchuyen  ,
+                soxe               ,
+                ghi_chu            ,
+                rate               ,
+                tax_rate           ,
+                order_quantity_uom ,
+                primary_uom_code   ,
+                secondary_uom_code 
+
+
+            )
+            select  
+              --rsh.receipt_num sochungtu,
+              oh.order_number sochungtu,
+           --to_char(mmt.transaction_date, 'DD/MM/RRRR') ngaychungtu,
+           to_char(OH.ordered_date, 'DD/MM/RRRR') ngaychungtu,
+           oh.order_number sodh,
+           ot.name loaidonhang,
+           apps.xxff_general_api.get_flex_value('CUS_LANHTHO', ter.segment1) vung,
+           apps.xxff_general_api.get_flex_value('CUS_MIEN_KHUVUC', ter.segment3) khuvuc,
+           oh.sales_channel_code manhomkhachhang,
+           (select description
+              from apps.fnd_lookup_values 
+             where lookup_type = 'SALES_CHANNEL'
+               and lookup_code = oh.sales_channel_code
+               and rownum = 1) tennhomkhachhang,
+           hca.account_number makhachhang,
+           hp.party_name tenkhachhang,
+           xxff_om_pub_api.get_addr_sale_order(p_site_use_id =>oh.invoice_to_org_id) diachi,
+           nvl(oh.attribute4,xxff_om_pub_api.get_addr_sale_order(p_site_use_id =>oh.ship_to_org_id))   noigiaohang,
+           mp.organization_code makho,
+           mcat.category_concat_segs manhomhang,
+           msi.segment1 mahang,
+           msi.description tenhang,
+           --mtln.lot_number solo,
+           null solo,
+           --mln.grade_code phanloai,
+           null phanloai,
+           --to_char(mln.origination_date, 'DD/MM/RRRR') ngaysanxuat,
+           null ngaysanxuat,
+           --trunc(mln.origination_date) mln_orig_date,
+           null  mln_orig_date,
+           msi.primary_uom_code dvt,
+          ---abs(nvl(mtln.primary_quantity, mmt.primary_quantity)) khoiluong,
+          OL.ordered_quantity *-1 khoiluong,
+          ---abs(nvl(mtln.secondary_transaction_quantity,mmt.secondary_transaction_quantity))  soluong,
+          1 soluong,
+           --apps.xxff_general_api.to_number1(mln.n_attribute10) tytrongthucte,
+           null tytrongthucte,
+          --abs(apps.xxff_general_api.to_number1(mln.n_attribute1)) meta,
+          --abs(apps.xxff_general_api.to_number1(mln.n_attribute2)) metb,
+          --abs(apps.xxff_general_api.to_number1(mln.n_attribute3)) metc,
+           null meta,
+           null metb,
+           null metc,
+           null tytrong,       
+            0 giavon,                                                                             
+           ol.unit_selling_price giaban,
+           1 uom_conversion,
+           1 uom_conversion1,
+           --apps.xxff_general_api.to_number1(rsh.attribute5) dongiavanchuyen,
+           null dongiavanchuyen,
+           --rsh.attribute3 madonvivanchuyen,
+           null madonvivanchuyen,
+          null tendonvivanchuyen,
+           --rsh.attribute4 soxe,
+           null soxe,
+           --rsh.comments,
+           'ITEMCK' comments,
+       case when oh.transactional_curr_code <> 'VND' then 
+                 xxff_om_055_api.get_curr_conversion_rate(oh.transactional_curr_code, trunc(OH.ordered_date))
+                else
+                    1                                                                                  
+           end rate,
+       case
+         when (ol.tax_code not like '%EX'  and OL.tax_code != 'AR_VAT8')then 
+            xxff_om_055_api.get_rate(ol.tax_code) --(select percentage_rate from zx_rates_b where tax_rate_code=ol.tax_code) 
+       end tax_rate,
+       ol.order_quantity_uom ,
+       msi.primary_uom_code,
+       msi.secondary_uom_code  
+from 
+           apps.mtl_system_items_b          msi,
+           apps.oe_order_lines_all          ol,
+           apps.oe_order_headers_all        oh,
+           apps.oe_transaction_types_tl     ot,
+           apps.hz_cust_accounts            hca,
+           apps.hz_cust_site_uses_all       hcsu,
+           apps.ra_territories              ter,
+           apps.hz_parties                  hp,
+           apps.mtl_parameters              mp,
+           apps.ssg_organization_tbl                ORG,
+           mtl_item_category_inv_v MCAT
+     where 1 = 1 --and oh.order_number='210031900011'
+       and msi.organization_id = l_master_org
+--       and rt.shipment_header_id = rsh.shipment_header_id
+--       and rt.oe_order_line_id = ol.line_id 
+       and ol.header_id = oh.header_id  
+       and oh.order_type_id = ot.transaction_type_id
+       and oh.sold_to_org_id = hca.cust_account_id
+       and oh.invoice_to_org_id = hcsu.site_use_id(+)
+       and hcsu.territory_id = ter.territory_id(+)
+       and hca.party_id = hp.party_id
+       and OL.ship_from_org_id = mp.organization_id
+       and MSI.inventory_item_id = OL.inventory_item_id
+--       and mmt.organization_id = mcat.organization_id
+       and MSI.inventory_item_id = mcat.inventory_item_id
+       and OL.line_category_code = 'RETURN'
+       and MSI.INVENTORY_ITEM_FLAG = 'N'
+       AND msi.organization_id = org.organization_id(+)
+       and org.operating_unit(+) = oh.org_id
+       --
+
+       and (OL.ship_from_org_id = l_inv_org_id or l_inv_org_id is null)
+--       and (oh.order_number >= p_tu_don_hang or p_tu_don_hang is null)
+--       and (oh.order_number <= p_den_don_hang or p_den_don_hang is null)
+--       and     (p_sales_channel is null or OH.sales_channel_code = p_sales_channel)
+       --and      HSG_RESP_SALECHANEL(OH.sales_channel_code,'SALE_CHANEL',oh.org_id ) = 1 -- SONG31052022
+--       and OH.ordered_date between  l_start_date and l_end_date
+
+--       and (mcat.category_concat_segs >= p_from_item_category or  p_from_item_category is null)
+--       and (mcat.category_concat_segs <= p_to_item_category or p_to_item_category is null)
+--       and (hca.account_number >= p_customer_no_from or p_customer_no_from is null)
+--       and (hca.account_number <= p_customer_no_to or  p_customer_no_to is null)
+       and (org.operating_unit = l_ou_id)
+       and OH.ordered_date between  l_start_date and l_end_date
+       --AND ROWNUM <= 1000000  -- Thien bo 26Jul22
+       ;
+        ----xxff_logs_api.insert_trace_log('OM_055', 1, 'OK03 ' || to_char(systimestamp, 'DD-MM-YYYY HH24:MI:SS.FF3') || sql%rowcount);
+
+        insert into SSG_OM_RPT_055_TBL2(
+            SOCHUNGTU          ,
+            NGAYCHUNGTU        ,
+            SODH               ,
+            LOAIDONHANG        ,
+            VUNG               ,
+            KHUVUC             ,
+            MANHOMKHACHHANG    ,
+            TENNHOMKHACHHANG   ,
+            MAKHACHHANG        ,
+            TENKHACHHANG       ,
+            DIACHI             ,
+            NOIGIAOHANG        ,
+            DONVI_NHAN         ,
+            MAKHO              ,
+            MANHOMHANG         ,
+            MAHANG             ,
+            TENHANG            ,
+            SOLO               ,
+            PHANLOAI           ,
+            NGAYSANXUAT        ,
+            MLN_ORIG_DATE      ,
+            DVT                ,
+            KHOILUONG          ,
+            SOLUONG            ,
+            SOLUONGTHUCTE      ,
+            META               ,
+            METB               ,
+            METC               ,
+            TYTRONG            ,
+            GIAVON             ,
+            THANHTIEN          ,
+            THANHTIENBAN       ,
+            GIABAN             ,
+            GIABANQUYDOI       ,
+            DONGIAVANCHUYEN    ,
+            LOT_NUMBER         ,
+            MADONVIVANCHUYEN   ,
+            TENDONVIVANCHUYEN  ,
+            SOXE               ,
+            GHI_CHU            ,
+            TAX_RATE           ,
+            TAIXE, -- THANG THEM 16022022
+            LPN                ,
+                KHOILUONGGROSS ,
+                LOAILOI
+
+        )
+        select sochungtu,
+            ngaychungtu,
+            sodh,
+            loaidonhang,
+            vung,
+            khuvuc,
+            manhomkhachhang,
+            tennhomkhachhang,
+            makhachhang,
+            tenkhachhang,
+            diachi,
+            noigiaohang,
+            donvi_nhan,
+            makho,
+            manhomhang,
+            mahang,
+            tenhang,
+            solo,
+            phanloai,
+            ngaysanxuat,
+            mln_orig_date,
+            dvt,
+            case when ghi_chu = 'ITEMCK' then null
+            else
+            decode(dvt, 'KG', khoiluong,khoiluong*uom_conversion1)  
+            end khoiluong,
+            decode(dvt, 'KG', soluong,khoiluong)  soluong,
+            decode(dvt, 'KG', soluong,khoiluong) *tytrongthucte soluongthucte,
+            meta,
+            metb,
+            metc,
+            tytrong,                                                                                                                                     
+            giavon,              
+            round(nvl(khoiluong,soluong)*nvl(giavon,0)) thanhtien,
+     --       nvl(khoiluong,soluong)*(giaban/(1+nvl(tax_rate,0)/100)*rate)/nvl(uom_conversion,1) thanhtienban,
+--            round(nvl(khoiluong,soluong)* case 
+--                when order_quantity_uom = secondary_uom_code   then
+--                    rate*giaban* decode(dvt, 'KG', soluong,khoiluong)/decode(dvt, 'KG', khoiluong,khoiluong*uom_conversion1)
+--                 else
+--                    (giaban/(1+nvl(tax_rate,0)/100)*rate)/nvl(uom_conversion,1)
+--             end) thanhtienban, -- SONG SUA 09/06/2021
+             round (nvl(khoiluong,soluong)* (case 
+                when order_quantity_uom = secondary_uom_code and dvt =  'KG' then
+                    rate*(giaban/(1+nvl(tax_rate,0)/100))*  soluong/khoiluong
+                 else
+                    (giaban/(1+nvl(tax_rate,0)/100)*rate)/nvl(uom_conversion,1)
+             end)) thanhtienban,
+            giaban/(1+nvl(tax_rate,0)/100) giaban,
+      --      (giaban/(1+nvl(tax_rate,0)/100)*rate)/nvl(uom_conversion,1) giabanquydoi,
+--             case 
+--                when order_quantity_uom = secondary_uom_code   then
+--                    rate*giaban* decode(dvt, 'KG', soluong,khoiluong)/decode(dvt, 'KG', khoiluong,khoiluong*uom_conversion1)
+--                 else
+--                    (giaban/(1+nvl(tax_rate,0)/100)*rate)/nvl(uom_conversion,1)
+--             end giabanquydoi,-- SONG SUA 10062021
+             case 
+                when order_quantity_uom = secondary_uom_code and dvt =  'KG' then
+                    rate*(giaban/(1+nvl(tax_rate,0)/100))*  soluong/khoiluong
+                 else
+                    (giaban/(1+nvl(tax_rate,0)/100)*rate)/nvl(uom_conversion,1)
+             end giabanquydoi,
+            ((dongiavanchuyen/(1+nvl(tax_rate,0)/100))*rate)/nvl(uom_conversion,1) dongiavanchuyen,                
+            solo lot_number,
+            madonvivanchuyen,
+            tendonvivanchuyen,
+            soxe,
+            ghi_chu,
+            tax_rate,
+            TAIXE, -- thang them 16022022
+            LPN                ,
+                KHOILUONGGROSS,
+                LOAILOI
+
+        from SSG_OM_RPT_055_TMP2;
+       ----xxff_logs_api.insert_trace_log('OM_055', 1, 'OK98 ' || to_char(systimestamp, 'DD-MM-YYYY HH24:MI:SS.FF3'));
+       open x_cursor for 
+       select
+            sochungtu         ,
+            ngaychungtu       ,
+            sodh              ,
+            loaidonhang       ,
+            vung              ,
+            khuvuc            ,
+            manhomkhachhang   ,
+            tennhomkhachhang  ,
+            makhachhang       ,
+            tenkhachhang      ,
+            diachi            ,
+            noigiaohang       ,
+            donvi_nhan        ,
+            makho             ,
+            manhomhang        ,
+            mahang            ,
+            tenhang           ,
+            solo              ,
+            phanloai          ,
+            ngaysanxuat       ,
+            mln_orig_date     ,
+            dvt               ,
+            khoiluong         ,
+            soluong           ,
+            soluongthucte     ,
+            meta              ,
+            metb              ,
+            metc              ,
+            tytrong           ,
+            giavon            ,
+            thanhtien         ,
+            thanhtienban      ,
+            giaban            ,
+            giabanquydoi      ,
+            dongiavanchuyen   ,
+            lot_number        ,
+            madonvivanchuyen  ,
+            tendonvivanchuyen ,
+            soxe              ,
+            ghi_chu           ,
+            tax_rate          ,
+            SSG_OM_RPT_055_TBL2.LPN                ,
+                SSG_OM_RPT_055_TBL2.khoiluonggross,
+            nvl(thanhtienban, 0) - nvl(thanhtien, 0)    loinhuan,
+            TAIXE --thang them 16022022,
+            , SSG_OM_RPT_055_TBL2.LOAILOI
+        from    ssg_om_rpt_055_tbl2
+        where  HSG_RESP_SALECHANEL(manhomkhachhang,'SALE_CHANEL',l_ou_id) = 1;
+        ----xxff_logs_api.insert_trace_log('OM_055', 1, 'OK99 ' || to_char(systimestamp, 'DD-MM-YYYY HH24:MI:SS.FF3'));
+    exception
+        when others then
+            --xxff_logs_api.insert_trace_log('OM_055', 1, sqlerrm || dbms_utility.format_error_backtrace);
+            open x_cursor for select 1 from dual;
+    end fetch_data;
+end xxff_om_055_api_gd2_improve;
